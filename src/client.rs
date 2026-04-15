@@ -1347,6 +1347,131 @@ where
                             .push_back(ExtendedProtocolData::create_new_close(message, close));
                     }
 
+                    // Flush
+                    // Frontend asks the server to push pending responses
+                    // without ending the extended-query sequence. The
+                    // server stays in extended-query mode (no
+                    // ReadyForQuery) and we keep the server checked out.
+                    // Used by drivers like postgres.js between
+                    // Parse/Describe and Bind/Execute (`describeFirst`).
+                    'H' => {
+                        debug!("Flushing buffered extended-protocol messages to server");
+
+                        // Drain the buffered extended-protocol messages
+                        // into self.buffer the same way Sync does, but
+                        // without sending Sync — append the Flush byte
+                        // instead so the server pushes responses but
+                        // stays in extended-query state.
+                        while let Some(protocol_data) =
+                            self.extended_protocol_data_buffer.pop_front()
+                        {
+                            match protocol_data {
+                                ExtendedProtocolData::Parse { data, metadata } => {
+                                    let (parse, hash) = match metadata {
+                                        Some(metadata) => metadata,
+                                        None => {
+                                            let first_char_in_name = *data.get(5).unwrap_or(&0);
+                                            if first_char_in_name != 0 {
+                                                server.mark_dirty();
+                                            }
+                                            self.buffer.put(&data[..]);
+                                            continue;
+                                        }
+                                    };
+
+                                    if server.has_prepared_statement(&parse.name) {
+                                        self.response_message_queue_buffer.put(parse_complete());
+                                    } else {
+                                        self.register_parse_to_server_cache(
+                                            false, &hash, &parse, &pool, server, &address,
+                                        )
+                                        .await?;
+                                        self.buffer.put(&data[..]);
+                                    }
+                                }
+                                ExtendedProtocolData::Bind { data, metadata } => {
+                                    if let Some(client_given_name) = metadata {
+                                        self.ensure_prepared_statement_is_on_server(
+                                            client_given_name,
+                                            &pool,
+                                            server,
+                                            &address,
+                                        )
+                                        .await?;
+                                    }
+                                    self.buffer.put(&data[..]);
+                                }
+                                ExtendedProtocolData::Describe { data, metadata } => {
+                                    if let Some(client_given_name) = metadata {
+                                        self.ensure_prepared_statement_is_on_server(
+                                            client_given_name,
+                                            &pool,
+                                            server,
+                                            &address,
+                                        )
+                                        .await?;
+                                    }
+                                    self.buffer.put(&data[..]);
+                                }
+                                ExtendedProtocolData::Execute { data } => {
+                                    self.buffer.put(&data[..])
+                                }
+                                ExtendedProtocolData::Close { data, close } => {
+                                    if self.prepared_statements_enabled
+                                        && close.is_prepared_statement()
+                                        && !close.anonymous()
+                                    {
+                                        self.prepared_statements.remove(&close.name);
+                                        self.response_message_queue_buffer.put(close_complete());
+                                    } else {
+                                        self.buffer.put(&data[..]);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Append the Flush byte so the server pushes its
+                        // pending responses now.
+                        self.buffer.put(&message[..]);
+
+                        // If the buffer contains only the Flush byte (no
+                        // pending extended-protocol work), there is
+                        // nothing for the server to flush — just emit any
+                        // queued client responses and continue.
+                        let only_flush = *self.buffer.first().unwrap() == b'H';
+
+                        if !self.response_message_queue_buffer.is_empty() {
+                            if let Err(err) = write_all_flush(
+                                &mut self.write,
+                                &self.response_message_queue_buffer,
+                            )
+                            .await
+                            {
+                                server.mark_bad(err.to_string().as_str());
+                                return Err(err);
+                            }
+                            self.response_message_queue_buffer.clear();
+                        }
+
+                        if !only_flush {
+                            self.send_and_receive_loop(
+                                code,
+                                None,
+                                server,
+                                &address,
+                                &pool,
+                                &self.stats.clone(),
+                            )
+                            .await?;
+                        }
+
+                        self.buffer.clear();
+
+                        // Do NOT release the server: extended-query
+                        // exchange is still open. A Sync from the client
+                        // will eventually end it.
+                    }
+
                     // Sync
                     // Frontend (client) is asking for the query result now.
                     'S' => {
