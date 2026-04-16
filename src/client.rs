@@ -1454,15 +1454,33 @@ where
                         }
 
                         if !only_flush {
-                            self.send_and_receive_loop(
-                                code,
-                                None,
-                                server,
-                                &address,
-                                &pool,
-                                &self.stats.clone(),
-                            )
-                            .await?;
+                            // Send to server.
+                            self.send_server_message(server, &self.buffer, &address, &pool)
+                                .await?;
+
+                            // Read the Flush response — must NOT use the
+                            // normal recv loop because the server does not
+                            // send ReadyForQuery in response to Flush.
+                            let response = match server
+                                .recv_flush_response(Some(&mut self.server_parameters))
+                                .await
+                            {
+                                Ok(r) => r,
+                                Err(err) => {
+                                    pool.ban(&address, BanReason::MessageReceiveFailed, Some(&self.stats));
+                                    error_response_terminal(
+                                        &mut self.write,
+                                        &format!("error receiving Flush response: {:?}", err),
+                                    )
+                                    .await?;
+                                    return Err(err);
+                                }
+                            };
+
+                            if let Err(err) = write_all_flush(&mut self.write, &response).await {
+                                server.mark_bad(err.to_string().as_str());
+                                return Err(err);
+                            }
                         }
 
                         self.buffer.clear();
