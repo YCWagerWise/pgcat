@@ -1,0 +1,16 @@
+FROM rust:1.83-slim AS build
+RUN apt-get update && apt-get install -y -qq pkg-config libssl-dev cmake && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# Strip jemalloc — not needed on Mac arm64 either, keep parity with prod.
+RUN sed -i '/^jemallocator = /d' Cargo.toml && \
+    sed -i '/^use jemallocator::Jemalloc;/,/^static GLOBAL: Jemalloc = Jemalloc;/d' src/main.rs && \
+    sed -i '/^#\[cfg(not(target_env = "msvc"))\]$/d' src/main.rs
+RUN cargo build --release -j 2
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y -qq libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/pgcat /usr/local/bin/pgcat
+WORKDIR /etc/pgcat
+EXPOSE 5432
+CMD ["pgcat", "/etc/pgcat/pgcat.toml"]

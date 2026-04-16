@@ -1114,6 +1114,92 @@ impl Server {
         Ok(bytes)
     }
 
+    /// Read server messages emitted in response to a Flush.
+    ///
+    /// Unlike `recv`, this loop never waits for ReadyForQuery (`Z`) —
+    /// the server does not send one in response to Flush. Instead we
+    /// read every message available, and stop once we hit a terminal
+    /// describe-response marker (RowDescription `T`, NoData `n`,
+    /// ParameterDescription `t`-followed-by-T-or-n, or ErrorResponse
+    /// `E`). On error we still keep buffering until ReadyForQuery
+    /// is NOT expected — we just return what we have.
+    pub async fn recv_flush_response(
+        &mut self,
+        mut client_server_parameters: Option<&mut ServerParameters>,
+    ) -> Result<BytesMut, Error> {
+        let mut saw_terminal = false;
+        loop {
+            let mut message = match read_message(&mut self.stream).await {
+                Ok(message) => message,
+                Err(err) => {
+                    error!(
+                        "Terminating server {:?} during Flush response: {:?}",
+                        self.address, err
+                    );
+                    self.bad = true;
+                    return Err(err);
+                }
+            };
+
+            self.buffer.put(&message[..]);
+            let code = message.get_u8() as char;
+            let _len = message.get_i32();
+
+            match code {
+                // ParameterStatus — track session params.
+                'S' => {
+                    let key = message.read_string().unwrap();
+                    let value = message.read_string().unwrap();
+                    if let Some(client_server_parameters) = client_server_parameters.as_mut() {
+                        client_server_parameters.set_param(key.clone(), value.clone(), false);
+                    }
+                    self.server_parameters.set_param(key, value, false);
+                }
+
+                // ParseComplete — describe-only flush returns this alone.
+                '1' => {
+                    self.registering_prepared_statement.pop_front();
+                    // If client only sent Parse+Flush, no further messages
+                    // are coming. But normally client also sent Describe,
+                    // so keep reading for ParameterDescription/RowDescription.
+                }
+
+                // Terminal describe-response markers.
+                // RowDescription / NoData / ErrorResponse — once the
+                // server has emitted one of these the describe round-trip
+                // is complete.
+                'T' | 'n' | 'E' => {
+                    saw_terminal = true;
+                    self.data_available = false;
+                    break;
+                }
+
+                // ParameterDescription — sent before RowDescription/NoData.
+                // Keep reading.
+                't' => (),
+
+                // BindComplete — possible if Flush follows Bind.
+                '2' => {
+                    saw_terminal = true;
+                    self.data_available = false;
+                    break;
+                }
+
+                _ => (),
+            }
+
+            if saw_terminal {
+                break;
+            }
+        }
+
+        let bytes = self.buffer.clone();
+        self.stats().data_received(bytes.len());
+        self.buffer.clear();
+        self.last_activity = SystemTime::now();
+        Ok(bytes)
+    }
+
     // Determines if the server already has a prepared statement with the given name
     // Increments the prepared statement cache hit counter
     pub fn has_prepared_statement(&mut self, name: &str) -> bool {
