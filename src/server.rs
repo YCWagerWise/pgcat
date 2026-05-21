@@ -1127,9 +1127,8 @@ impl Server {
         &mut self,
         mut client_server_parameters: Option<&mut ServerParameters>,
     ) -> Result<BytesMut, Error> {
-        let mut saw_terminal = false;
         loop {
-            let mut message = match read_message(&mut self.stream).await {
+            let message = match read_message(&mut self.stream).await {
                 Ok(message) => message,
                 Err(err) => {
                     error!(
@@ -1141,61 +1140,51 @@ impl Server {
                 }
             };
 
-            self.buffer.put(&message[..]);
-            let code = message.get_u8() as char;
-            let _len = message.get_i32();
+            // Inspect framing byte without consuming the message — avoid
+            // re-parsing length and avoid the double copy of body bytes.
+            let code = *message.first().unwrap_or(&0);
 
-            match code {
-                // ParameterStatus — track session params.
-                'S' => {
-                    let key = message.read_string().unwrap();
-                    let value = message.read_string().unwrap();
+            // Only ParameterStatus needs body parsing (to track session
+            // params). Skip get_u8/get_i32/read_string for everything
+            // else — these messages are 5–N bytes and we only need to
+            // know the framing byte.
+            if code == b'S' {
+                // ParameterStatus body: code(1) + len(4) + key\0 + value\0.
+                // Parse into an owned BytesMut just for the body so we
+                // can use the existing BytesMutReader impl without
+                // disturbing the original `message` we still need to
+                // append to self.buffer below.
+                let mut body = BytesMut::from(&message[5..]);
+                if let (Ok(key), Ok(value)) = (body.read_string(), body.read_string()) {
                     if let Some(client_server_parameters) = client_server_parameters.as_mut() {
                         client_server_parameters.set_param(key.clone(), value.clone(), false);
                     }
                     self.server_parameters.set_param(key, value, false);
                 }
-
-                // ParseComplete — describe-only flush returns this alone.
-                '1' => {
-                    self.registering_prepared_statement.pop_front();
-                    // If client only sent Parse+Flush, no further messages
-                    // are coming. But normally client also sent Describe,
-                    // so keep reading for ParameterDescription/RowDescription.
-                }
-
-                // Terminal describe-response markers.
-                // RowDescription / NoData / ErrorResponse — once the
-                // server has emitted one of these the describe round-trip
-                // is complete.
-                'T' | 'n' | 'E' => {
-                    saw_terminal = true;
-                    self.data_available = false;
-                    break;
-                }
-
-                // ParameterDescription — sent before RowDescription/NoData.
-                // Keep reading.
-                't' => (),
-
-                // BindComplete — possible if Flush follows Bind.
-                '2' => {
-                    saw_terminal = true;
-                    self.data_available = false;
-                    break;
-                }
-
-                _ => (),
+            } else if code == b'1' {
+                // ParseComplete — consume one pending registration.
+                self.registering_prepared_statement.pop_front();
             }
 
-            if saw_terminal {
+            self.buffer.extend_from_slice(&message);
+
+            // Terminal describe/bind-response markers — server done
+            // emitting in response to this Flush.
+            //  T = RowDescription, n = NoData, E = ErrorResponse,
+            //  2 = BindComplete (Flush after Bind w/o Execute).
+            if matches!(code, b'T' | b'n' | b'E' | b'2') {
+                self.data_available = false;
                 break;
             }
         }
 
-        let bytes = self.buffer.clone();
+        // mem::take instead of clone — hands the BytesMut to caller
+        // without a memcpy+alloc. self.buffer is left empty with retained
+        // capacity is NOT a concern; the empty BytesMut here is fine
+        // because we reuse it next call (push triggers fresh alloc on
+        // first put, identical cost to the prior clear()).
+        let bytes = std::mem::take(&mut self.buffer);
         self.stats().data_received(bytes.len());
-        self.buffer.clear();
         self.last_activity = SystemTime::now();
         Ok(bytes)
     }
