@@ -1397,6 +1397,32 @@ impl Server {
     /// Perform any necessary cleanup before putting the server
     /// connection back in the pool
     pub async fn checkin_cleanup(&mut self) -> Result<(), Error> {
+        // If the client dropped mid-COPY-IN we MUST abort the COPY before
+        // anything else. The backend is in CopyIn state and will treat any
+        // bytes we send (including a Query 'Q' message for "ROLLBACK") as
+        // raw CopyData, leaving the COPY (and the surrounding transaction)
+        // hung forever. CopyFail ('f') is the only way out: backend replies
+        // with ErrorResponse + ReadyForQuery, which also aborts the txn.
+        if self.in_copy_mode() {
+            warn!(target: "pgcat::server::cleanup", "Server returned while still in copy-mode, sending CopyFail to abort");
+            let mut copy_fail = BytesMut::new();
+            let msg = b"client disconnected mid-COPY";
+            copy_fail.put_u8(b'f');
+            copy_fail.put_i32(4 + msg.len() as i32 + 1);
+            copy_fail.put_slice(msg);
+            copy_fail.put_u8(0);
+            // Also send Sync so we get a clean ReadyForQuery back regardless.
+            copy_fail.extend_from_slice(&sync());
+            self.send(&copy_fail).await?;
+            // Drain until ReadyForQuery — at minimum we'll see ErrorResponse
+            // for the aborted COPY and then 'Z'. recv() blocks on 'Z'.
+            self.recv(None).await?;
+            self.in_copy_mode = false;
+            // CopyFail implicitly aborts the transaction on the backend,
+            // so we can skip the explicit ROLLBACK below.
+            self.in_transaction = false;
+        }
+
         // Client disconnected with an open transaction on the server connection.
         // Pgbouncer behavior is to close the server connection but that can cause
         // server connection thrashing if clients repeatedly do this.
@@ -1429,10 +1455,6 @@ impl Server {
 
             self.query(&reset_string).await?;
             self.cleanup_state.reset();
-        }
-
-        if self.in_copy_mode() {
-            warn!(target: "pgcat::server::cleanup", "Server returned while still in copy-mode");
         }
 
         Ok(())
