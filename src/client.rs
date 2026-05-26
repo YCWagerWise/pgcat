@@ -1886,29 +1886,37 @@ where
                     .register_parse_to_server_cache(true, hash, parse, pool, server, address)
                     .await
                 {
-                    Ok(_) => (),
-                    Err(err) => match err {
-                        Error::PreparedStatementError => {
-                            debug!("Removed {} from client cache", client_name);
-                            self.prepared_statements.remove(&client_name);
-                        }
-
-                        _ => {
-                            return Err(err);
-                        }
-                    },
+                    Ok(_) => Ok(()),
+                    Err(Error::PreparedStatementError) => {
+                        // The backend rejected our Parse. This used to silently
+                        // drop the statement from the *client* cache and return
+                        // Ok, which left tokio-postgres clients believing the
+                        // statement was still valid: the very next Bind would
+                        // miss in `buffer_bind` and abort the whole TCP conn
+                        // with "Prepared statement sN doesn't exist", killing
+                        // pgraft-style ETL workloads that prepare-then-reuse
+                        // across many transactions.
+                        //
+                        // Keep the client cache intact (it represents what the
+                        // client believes), mark this server bad so the pool
+                        // replaces it on next checkout, and surface the error
+                        // so the caller can retry on a fresh backend.
+                        warn!(
+                            "Server {:?} rejected re-prepare of `{}` — marking bad so pool replaces it",
+                            address, client_name
+                        );
+                        server.mark_bad("prepared statement re-register failed");
+                        Err(Error::PreparedStatementError)
+                    }
+                    Err(err) => Err(err),
                 }
             }
 
-            None => {
-                return Err(Error::ClientError(format!(
-                    "prepared statement `{}` not found",
-                    client_name
-                )))
-            }
-        };
-
-        Ok(())
+            None => Err(Error::ClientError(format!(
+                "prepared statement `{}` not found",
+                client_name
+            ))),
+        }
     }
 
     /// Register the parse to the server cache and send it to the server if requested (ie. requested by pgcat)
