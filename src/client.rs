@@ -1760,6 +1760,11 @@ where
                         self.send_server_message(server, &self.buffer, &address, &pool)
                             .await?;
                         self.buffer.clear();
+                        // Backend exits CopyIn as soon as it parses CopyDone/CopyFail.
+                        // Clear the flag now so a mid-flight client disconnect can't
+                        // trigger checkin_cleanup's CopyFail path against a backend
+                        // that's already out of CopyIn (would break protocol sync).
+                        server.exit_copy_mode();
 
                         if self.copy_waits_for_sync {
                             // Extended-protocol COPY clients pipeline a trailing

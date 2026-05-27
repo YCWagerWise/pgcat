@@ -1099,13 +1099,10 @@ impl Server {
             };
         }
 
-        let bytes = self.buffer.clone();
+        let bytes = self.buffer.split();
 
         // Keep track of how much data we got from the server for stats.
         self.stats().data_received(bytes.len());
-
-        // Clear the buffer for next query.
-        self.buffer.clear();
 
         // Successfully received data from server
         self.last_activity = SystemTime::now();
@@ -1298,6 +1295,14 @@ impl Server {
     /// Currently copying data from client to server or vice-versa.
     pub fn in_copy_mode(&self) -> bool {
         self.in_copy_mode
+    }
+
+    /// Mark the server as no longer in copy mode. Used by the client when
+    /// CopyDone/CopyFail is forwarded — the backend exits CopyIn as soon
+    /// as it parses that message, so sending a second CopyFail in
+    /// checkin_cleanup would land outside CopyIn and break protocol sync.
+    pub fn exit_copy_mode(&mut self) {
+        self.in_copy_mode = false;
     }
 
     /// We don't buffer all of server responses, e.g. COPY OUT produces too much data.
