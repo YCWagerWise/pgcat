@@ -2028,9 +2028,30 @@ where
                 Ok(())
             }
             None => {
-                debug!(
-                    "Got bind for unknown prepared statement {:?}",
-                    client_given_name
+                // INSTRUMENTATION: dump current cache state at failure.
+                // Helps diagnose whether the miss is "never inserted" vs
+                // "inserted then evicted via Close" vs some other path.
+                let mut cache_keys: Vec<&String> = self.prepared_statements.keys().collect();
+                cache_keys.sort();
+                let total = cache_keys.len();
+                let nearby: Vec<&&String> = cache_keys
+                    .iter()
+                    .filter(|k| {
+                        // Bracket the missing name to see if neighbours exist
+                        if let (Some(want_num), Some(k_num)) = (
+                            client_given_name.strip_prefix('s').and_then(|s| s.parse::<u64>().ok()),
+                            k.strip_prefix('s').and_then(|s| s.parse::<u64>().ok()),
+                        ) {
+                            (k_num as i64 - want_num as i64).abs() <= 5
+                        } else {
+                            false
+                        }
+                    })
+                    .take(12)
+                    .collect();
+                warn!(
+                    "buffer_bind miss for `{}`: cache has {} entries, nearby (within ±5) = {:?}",
+                    client_given_name, total, nearby
                 );
 
                 error_response(
