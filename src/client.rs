@@ -113,6 +113,12 @@ pub struct Client<S, T> {
 
     /// Buffered extended protocol data
     extended_protocol_data_buffer: VecDeque<ExtendedProtocolData>,
+
+    /// Set after extended-protocol CopyDone forwarded to server. The trailing
+    /// Sync from the client must reach the server to make it flush the pending
+    /// CommandComplete + ReadyForQuery — the usual short-circuit that fakes
+    /// an RFQ when the buffer is "just Sync" would deadlock here.
+    pending_copy_response: bool,
 }
 
 /// Client entrypoint.
@@ -785,6 +791,7 @@ where
             prepared_statements_enabled,
             prepared_statements: HashMap::new(),
             extended_protocol_data_buffer: VecDeque::new(),
+            pending_copy_response: false,
         })
     }
 
@@ -823,6 +830,7 @@ where
             prepared_statements_enabled: false,
             prepared_statements: HashMap::new(),
             extended_protocol_data_buffer: VecDeque::new(),
+            pending_copy_response: false,
         })
     }
 
@@ -1467,7 +1475,11 @@ where
                             {
                                 Ok(r) => r,
                                 Err(err) => {
-                                    pool.ban(&address, BanReason::MessageReceiveFailed, Some(&self.stats));
+                                    pool.ban(
+                                        &address,
+                                        BanReason::MessageReceiveFailed,
+                                        Some(&self.stats),
+                                    );
                                     error_response_terminal(
                                         &mut self.write,
                                         &format!("error receiving Flush response: {:?}", err),
@@ -1640,12 +1652,21 @@ where
                         let mut should_send_to_server = true;
 
                         // If we have just a sync message left (maybe after omitting sending some messages to the server) no need to send it to the server
-                        if *self.buffer.first().unwrap() == b'S' {
+                        // EXCEPT after extended-protocol CopyDone: the server has
+                        // pending CommandComplete + ReadyForQuery queued from the
+                        // original Parse/Bind/Execute/Sync batch, and forwarding
+                        // the client's trailing Sync is what makes PG flush them.
+                        // Faking RFQ here would drop that real response on the
+                        // floor and corrupt the next operation.
+                        if *self.buffer.first().unwrap() == b'S' && !self.pending_copy_response {
                             should_send_to_server = false;
                             // queue up a ready for query message to send to the client, respecting the transaction state of the server
                             self.response_message_queue_buffer
                                 .put(ready_for_query(server.in_transaction()));
                         }
+                        // Reset the flag — the server roundtrip below covers
+                        // the pending COPY response.
+                        self.pending_copy_response = false;
 
                         // Send all queued messages to the client
                         // NOTE: it's possible we don't perfectly send things back in the same order as postgres would,
@@ -1707,41 +1728,24 @@ where
                     }
 
                     // CopyDone or CopyFail
-                    // Copy is done, successfully or not.
+                    //
+                    // Append to whatever CopyData has accumulated, forward to
+                    // server, and return to the main loop. We do NOT await the
+                    // response here: in extended-protocol COPY the client
+                    // (tokio-postgres, asyncpg, pgx, ...) pipelines
+                    // CopyDone+Sync together, so the trailing Sync is the next
+                    // message in our read buffer. The 'S' handler will forward
+                    // that Sync to the server, which then flushes
+                    // CommandComplete + ReadyForQuery for the original
+                    // Parse/Bind/Execute/Sync batch. Awaiting here would
+                    // deadlock — PG doesn't flush those bytes until something
+                    // else (the trailing Sync) reaches it.
                     'c' | 'f' => {
-                        // We may already have some copy data in the buffer, add this message to buffer
                         self.buffer.put(&message[..]);
-
                         self.send_server_message(server, &self.buffer, &address, &pool)
                             .await?;
-
-                        // Clear the buffer
                         self.buffer.clear();
-
-                        let response = self
-                            .receive_server_message(server, &address, &pool, &self.stats.clone())
-                            .await?;
-
-                        match write_all_flush(&mut self.write, &response).await {
-                            Ok(_) => (),
-                            Err(err) => {
-                                server.mark_bad(err.to_string().as_str());
-                                return Err(err);
-                            }
-                        };
-
-                        if !server.in_transaction() {
-                            self.stats.transaction();
-                            server
-                                .stats()
-                                .transaction(self.server_parameters.get_application_name());
-
-                            // Release server back to the pool if we are in transaction mode.
-                            // If we are in session mode, we keep the server until the client disconnects.
-                            if self.transaction_mode {
-                                break;
-                            }
-                        }
+                        self.pending_copy_response = true;
                     }
 
                     // Some unexpected message. We either did not implement the protocol correctly
@@ -2039,7 +2043,9 @@ where
                     .filter(|k| {
                         // Bracket the missing name to see if neighbours exist
                         if let (Some(want_num), Some(k_num)) = (
-                            client_given_name.strip_prefix('s').and_then(|s| s.parse::<u64>().ok()),
+                            client_given_name
+                                .strip_prefix('s')
+                                .and_then(|s| s.parse::<u64>().ok()),
                             k.strip_prefix('s').and_then(|s| s.parse::<u64>().ok()),
                         ) {
                             (k_num as i64 - want_num as i64).abs() <= 5
