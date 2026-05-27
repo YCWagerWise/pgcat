@@ -114,10 +114,14 @@ pub struct Client<S, T> {
     /// Buffered extended protocol data
     extended_protocol_data_buffer: VecDeque<ExtendedProtocolData>,
 
-    /// Set after extended-protocol CopyDone forwarded to server. The trailing
-    /// Sync from the client must reach the server to make it flush the pending
-    /// CommandComplete + ReadyForQuery — the usual short-circuit that fakes
-    /// an RFQ when the buffer is "just Sync" would deadlock here.
+    /// Set when extended protocol COPY has started and the client still owes
+    /// the server a trailing Sync after CopyDone/CopyFail.
+    copy_waits_for_sync: bool,
+
+    /// Set after extended-protocol CopyDone/CopyFail is forwarded to server.
+    /// The trailing Sync from the client must reach the server to make it flush
+    /// the pending CommandComplete + ReadyForQuery. The usual short-circuit
+    /// that fakes an RFQ when the buffer is "just Sync" would deadlock here.
     pending_copy_response: bool,
 }
 
@@ -791,6 +795,7 @@ where
             prepared_statements_enabled,
             prepared_statements: HashMap::new(),
             extended_protocol_data_buffer: VecDeque::new(),
+            copy_waits_for_sync: false,
             pending_copy_response: false,
         })
     }
@@ -830,6 +835,7 @@ where
             prepared_statements_enabled: false,
             prepared_statements: HashMap::new(),
             extended_protocol_data_buffer: VecDeque::new(),
+            copy_waits_for_sync: false,
             pending_copy_response: false,
         })
     }
@@ -1194,8 +1200,15 @@ where
                             Ok(Ok(message)) => message,
                             Ok(Err(err)) => {
                                 // Client disconnected inside a transaction.
-                                // Clean up the server and re-use it.
                                 self.stats.disconnect();
+                                if self.pending_copy_response {
+                                    server.mark_bad(
+                                        "client disconnected after CopyDone/CopyFail before Sync",
+                                    );
+                                    return Err(err);
+                                }
+
+                                // Clean up the server and re-use it.
                                 server.checkin_cleanup().await?;
 
                                 return Err(err);
@@ -1306,6 +1319,15 @@ where
 
                     // Terminate
                     'X' => {
+                        if self.pending_copy_response {
+                            server
+                                .mark_bad("client terminated after CopyDone/CopyFail before Sync");
+                            self.stats.disconnect();
+                            self.release();
+
+                            return Ok(());
+                        }
+
                         server.checkin_cleanup().await?;
                         self.stats.disconnect();
                         self.release();
@@ -1664,9 +1686,7 @@ where
                             self.response_message_queue_buffer
                                 .put(ready_for_query(server.in_transaction()));
                         }
-                        // Reset the flag — the server roundtrip below covers
-                        // the pending COPY response.
-                        self.pending_copy_response = false;
+                        let pending_copy_response = self.pending_copy_response;
 
                         // Send all queued messages to the client
                         // NOTE: it's possible we don't perfectly send things back in the same order as postgres would,
@@ -1696,6 +1716,12 @@ where
                                 &self.stats.clone(),
                             )
                             .await?;
+
+                            if pending_copy_response {
+                                self.pending_copy_response = false;
+                            } else if server.in_copy_mode() {
+                                self.copy_waits_for_sync = true;
+                            }
                         }
 
                         self.buffer.clear();
@@ -1718,8 +1744,9 @@ where
                     'd' => {
                         self.buffer.put(&message[..]);
 
-                        // Want to limit buffer size
-                        if self.buffer.len() > 8196 {
+                        // Want to limit buffer size. 64 KiB matches PG's typical
+                        // wire chunk and cuts syscalls ~8× vs 8 KiB on bulk COPY.
+                        if self.buffer.len() > 65536 {
                             // Forward the data to the server,
                             self.send_server_message(server, &self.buffer, &address, &pool)
                                 .await?;
@@ -1728,24 +1755,48 @@ where
                     }
 
                     // CopyDone or CopyFail
-                    //
-                    // Append to whatever CopyData has accumulated, forward to
-                    // server, and return to the main loop. We do NOT await the
-                    // response here: in extended-protocol COPY the client
-                    // (tokio-postgres, asyncpg, pgx, ...) pipelines
-                    // CopyDone+Sync together, so the trailing Sync is the next
-                    // message in our read buffer. The 'S' handler will forward
-                    // that Sync to the server, which then flushes
-                    // CommandComplete + ReadyForQuery for the original
-                    // Parse/Bind/Execute/Sync batch. Awaiting here would
-                    // deadlock — PG doesn't flush those bytes until something
-                    // else (the trailing Sync) reaches it.
                     'c' | 'f' => {
                         self.buffer.put(&message[..]);
                         self.send_server_message(server, &self.buffer, &address, &pool)
                             .await?;
                         self.buffer.clear();
-                        self.pending_copy_response = true;
+
+                        if self.copy_waits_for_sync {
+                            // Extended-protocol COPY clients pipeline a trailing
+                            // Sync after CopyDone/CopyFail. Return to the main
+                            // loop so the 'S' handler can forward that real Sync
+                            // and receive CommandComplete + ReadyForQuery.
+                            self.copy_waits_for_sync = false;
+                            self.pending_copy_response = true;
+                        } else {
+                            // Simple-query COPY has no trailing Sync. The server
+                            // response must be read now, or the next Query would
+                            // see COPY's CommandComplete/ReadyForQuery first.
+                            let response = self
+                                .receive_server_message(
+                                    server,
+                                    &address,
+                                    &pool,
+                                    &self.stats.clone(),
+                                )
+                                .await?;
+
+                            if let Err(err) = write_all_flush(&mut self.write, &response).await {
+                                server.mark_bad(err.to_string().as_str());
+                                return Err(err);
+                            }
+
+                            if !server.in_transaction() {
+                                self.stats.transaction();
+                                server
+                                    .stats()
+                                    .transaction(self.server_parameters.get_application_name());
+
+                                if self.transaction_mode && !server.in_copy_mode() {
+                                    break;
+                                }
+                            }
+                        }
                     }
 
                     // Some unexpected message. We either did not implement the protocol correctly
@@ -2143,6 +2194,8 @@ where
         self.buffer.clear();
         self.extended_protocol_data_buffer.clear();
         self.response_message_queue_buffer.clear();
+        self.copy_waits_for_sync = false;
+        self.pending_copy_response = false;
     }
 
     /// Release the server from the client: it can't cancel its queries anymore.
