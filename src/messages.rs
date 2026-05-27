@@ -640,6 +640,8 @@ pub async fn read_message<S>(stream: &mut S) -> Result<BytesMut, Error>
 where
     S: tokio::io::AsyncRead + std::marker::Unpin,
 {
+    const MAX_MESSAGE_SIZE: i32 = 128 * 1024 * 1024;
+
     let code = match stream.read_u8().await {
         Ok(code) => code,
         Err(err) => {
@@ -660,23 +662,24 @@ where
         }
     };
 
-    let mut bytes = BytesMut::with_capacity(len as usize + 1);
-
-    bytes.put_u8(code);
-    bytes.put_i32(len);
-
-    bytes.resize(bytes.len() + len as usize - mem::size_of::<i32>(), b'0');
-
-    let slice_start = mem::size_of::<u8>() + mem::size_of::<i32>();
-    let slice_end = slice_start + len as usize - mem::size_of::<i32>();
-
-    // Avoids a panic
-    if slice_end < slice_start {
+    if !(4..=MAX_MESSAGE_SIZE).contains(&len) {
         return Err(Error::SocketError(format!(
             "Error reading message from socket - Code: {:?} - Length {:?}, Error: {:?}",
             code, len, "Unexpected length value for message"
         )));
     }
+
+    let body_len = len as usize - mem::size_of::<i32>();
+    let mut bytes =
+        BytesMut::with_capacity(body_len + mem::size_of::<u8>() + mem::size_of::<i32>());
+
+    bytes.put_u8(code);
+    bytes.put_i32(len);
+
+    bytes.resize(bytes.len() + body_len, b'0');
+
+    let slice_start = mem::size_of::<u8>() + mem::size_of::<i32>();
+    let slice_end = slice_start + body_len;
 
     match stream.read_exact(&mut bytes[slice_start..slice_end]).await {
         Ok(_) => (),
@@ -749,7 +752,12 @@ impl BytesMutReader for Cursor<&BytesMut> {
     fn read_string(&mut self) -> Result<String, Error> {
         let mut buf = vec![];
         match self.read_until(b'\0', &mut buf) {
-            Ok(_) => Ok(String::from_utf8_lossy(&buf[..buf.len() - 1]).to_string()),
+            Ok(_) if buf.last() == Some(&b'\0') => {
+                Ok(String::from_utf8_lossy(&buf[..buf.len() - 1]).to_string())
+            }
+            Ok(_) => Err(Error::ParseBytesError(
+                "Could not read null-terminated string".to_string(),
+            )),
             Err(err) => Err(Error::ParseBytesError(err.to_string())),
         }
     }

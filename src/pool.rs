@@ -533,6 +533,32 @@ impl ConnectionPool {
                     );
                 }
 
+                let sharding_key_regex = pool_config
+                    .sharding_key_regex
+                    .as_ref()
+                    .map(|regex| {
+                        Regex::new(regex.as_str()).map_err(|err| {
+                            Error::ClientError(format!(
+                                "invalid sharding_key_regex for pool {}: {}",
+                                pool_name, err
+                            ))
+                        })
+                    })
+                    .transpose()?;
+
+                let shard_id_regex = pool_config
+                    .shard_id_regex
+                    .as_ref()
+                    .map(|regex| {
+                        Regex::new(regex.as_str()).map_err(|err| {
+                            Error::ClientError(format!(
+                                "invalid shard_id_regex for pool {}: {}",
+                                pool_name, err
+                            ))
+                        })
+                    })
+                    .transpose()?;
+
                 let pool = ConnectionPool {
                     databases: Arc::new(shards),
                     addresses: Arc::new(addresses),
@@ -571,14 +597,8 @@ impl ConnectionPool {
                         healthcheck_delay: config.general.healthcheck_delay,
                         healthcheck_timeout: config.general.healthcheck_timeout,
                         ban_time: config.general.ban_time,
-                        sharding_key_regex: pool_config
-                            .sharding_key_regex
-                            .clone()
-                            .map(|regex| Regex::new(regex.as_str()).unwrap()),
-                        shard_id_regex: pool_config
-                            .shard_id_regex
-                            .clone()
-                            .map(|regex| Regex::new(regex.as_str()).unwrap()),
+                        sharding_key_regex,
+                        shard_id_regex,
                         regex_search_limit: pool_config.regex_search_limit.unwrap_or(1000),
                         default_shard: pool_config.default_shard,
                         auth_query: pool_config.auth_query.clone(),
