@@ -1402,6 +1402,25 @@ impl Server {
     /// Perform any necessary cleanup before putting the server
     /// connection back in the pool
     pub async fn checkin_cleanup(&mut self) -> Result<(), Error> {
+        // A server whose state we cannot fully reset MUST NOT go back into the
+        // pool. A half-cleaned connection — e.g. one left in an aborted
+        // transaction after a failed ROLLBACK, or a backend that errored mid
+        // cleanup — hands the NEXT client SQLSTATE 25P02 "current transaction
+        // is aborted, commands ignored until end of transaction block". That
+        // is the recurring jam. So if cleanup errors, or the server is somehow
+        // still in a transaction afterwards, mark it bad and let the checkout
+        // guard close it rather than recycle poison.
+        if let Err(err) = self.checkin_cleanup_inner().await {
+            self.mark_bad("checkin cleanup failed — discarding to avoid 25P02 reuse");
+            return Err(err);
+        }
+        if self.in_transaction() {
+            self.mark_bad("still in transaction after checkin cleanup — discarding");
+        }
+        Ok(())
+    }
+
+    async fn checkin_cleanup_inner(&mut self) -> Result<(), Error> {
         // If the client dropped mid-COPY-IN we MUST abort the COPY before
         // anything else. The backend is in CopyIn state and will treat any
         // bytes we send (including a Query 'Q' message for "ROLLBACK") as
