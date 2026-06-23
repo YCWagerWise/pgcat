@@ -640,8 +640,6 @@ pub async fn read_message<S>(stream: &mut S) -> Result<BytesMut, Error>
 where
     S: tokio::io::AsyncRead + std::marker::Unpin,
 {
-    const MAX_MESSAGE_SIZE: i32 = 128 * 1024 * 1024;
-
     let code = match stream.read_u8().await {
         Ok(code) => code,
         Err(err) => {
@@ -651,6 +649,22 @@ where
             )))
         }
     };
+
+    read_message_rest(stream, code).await
+}
+
+/// Read the remainder of a Postgres message given its already-consumed type byte.
+///
+/// `read_message` reads the type byte then the rest. When racing two sockets in a
+/// `tokio::select!` we cannot use `read_message` directly: `read_exact` is not
+/// cancellation-safe, so a dropped future can consume partial bytes and corrupt the
+/// stream. The cancel-safe pattern is to race ONLY the single-byte `read_u8` (which
+/// consumes 0 bytes when pending), then drive this to completion non-cancellably.
+pub async fn read_message_rest<S>(stream: &mut S, code: u8) -> Result<BytesMut, Error>
+where
+    S: tokio::io::AsyncRead + std::marker::Unpin,
+{
+    const MAX_MESSAGE_SIZE: i32 = 128 * 1024 * 1024;
 
     let len = match stream.read_i32().await {
         Ok(len) => len,

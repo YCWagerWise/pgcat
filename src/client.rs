@@ -425,6 +425,67 @@ pub async fn startup_tls(
     }
 }
 
+/// Cheap detection of a `LISTEN` simple-query without depending on the query parser
+/// (which is often disabled). Postgres clients issue LISTEN as a plain simple-query,
+/// so we sniff the leading keyword of a 'Q' message's query string. A client that
+/// LISTENs gets its server connection pinned for the rest of the session, so we only
+/// need to catch the first one — UNLISTEN does not need to un-pin.
+fn simple_query_is_listen(message: &BytesMut) -> bool {
+    // 'Q' | i32 len | query C-string
+    if message.first().copied() != Some(b'Q') || message.len() < 6 {
+        return false;
+    }
+
+    let body = &message[5..];
+    let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+    match std::str::from_utf8(&body[..end]) {
+        Ok(query) => leading_keyword_is_listen(query),
+        Err(_) => false,
+    }
+}
+
+/// Returns the leading keyword of a query string, lowercased-comparable. Splits on
+/// whitespace or `;` so `LISTEN chan`, `listen "x"` and `LISTEN chan;` all yield
+/// `LISTEN`.
+fn leading_keyword_is_listen(query: &str) -> bool {
+    query
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("listen")
+}
+
+/// Extended-protocol LISTEN detection. A Parse ('P') message is:
+///   'P' | i32 len | statement_name cstring | query cstring | i16 nparams | ...
+/// We skip the statement name and read the query cstring, then sniff its leading
+/// keyword. Works regardless of the query parser being enabled.
+fn parse_message_is_listen(message: &BytesMut) -> bool {
+    if message.first().copied() != Some(b'P') || message.len() < 6 {
+        return false;
+    }
+
+    // Body starts after type byte (1) + length (4).
+    let body = &message[5..];
+
+    // First cstring is the prepared-statement name (often empty). Skip past its NUL.
+    let name_end = match body.iter().position(|&b| b == 0) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    let query_bytes = &body[name_end + 1..];
+    let query_end = query_bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(query_bytes.len());
+
+    match std::str::from_utf8(&query_bytes[..query_end]) {
+        Ok(query) => leading_keyword_is_listen(query),
+        Err(_) => false,
+    }
+}
+
 impl<S, T> Client<S, T>
 where
     S: tokio::io::AsyncRead + std::marker::Unpin,
@@ -899,6 +960,13 @@ where
         query_router.update_pool_settings(&pool.settings);
         query_router.set_default_role();
 
+        // Latches true once the client issues LISTEN. From then on the server
+        // connection is pinned to this client for its lifetime (effectively session
+        // mode) so async NotificationResponse ('A') frames can be forwarded. A
+        // transaction-mode pool otherwise releases the server after each transaction,
+        // dropping notifications on the floor — see the LISTEN-aware idle wait below.
+        let mut listening = false;
+
         // Our custom protocol loop.
         // We expect the client to either start a transaction with regular queries
         // or issue commands for our sharding and server selection protocol.
@@ -1020,6 +1088,14 @@ where
                                 );
                             }
                         };
+                    }
+
+                    // Extended-protocol LISTEN as the first client message: the Parse
+                    // is buffered here before any server is checked out, so we latch
+                    // the intent and pin the server right after checkout (below).
+                    if !listening && parse_message_is_listen(&message) {
+                        listening = true;
+                        debug!("Client issued LISTEN (extended protocol, initial message); will pin server");
                     }
 
                     self.buffer_parse(message, &pool)?;
@@ -1156,6 +1232,12 @@ where
             server.claim(self.process_id, self.secret_key);
             self.connected_to_server = true;
 
+            // A LISTEN buffered in the initial-message loop pins this freshly checked
+            // out server so it gets UNLISTEN * at checkin and is never released early.
+            if listening {
+                server.mark_listening();
+            }
+
             // Update statistics
             self.stats.active();
 
@@ -1191,46 +1273,90 @@ where
                         // This is not an initial message so discard the initial_parsed_ast
                         initial_parsed_ast.take();
 
-                        match tokio::time::timeout(
-                            idle_client_timeout_duration,
-                            read_message(&mut self.read),
-                        )
-                        .await
-                        {
-                            Ok(Ok(message)) => message,
-                            Ok(Err(err)) => {
-                                // Client disconnected inside a transaction.
-                                self.stats.disconnect();
-                                if self.pending_copy_response {
-                                    server.mark_bad(
-                                        "client disconnected after CopyDone/CopyFail before Sync",
-                                    );
+                        // LISTEN-pinned: the client is idle between (or after) queries
+                        // but the server may push async notifications at any time. Race
+                        // both sockets and forward server frames ('A' NotificationResponse,
+                        // notices, param status) until the client sends its next message.
+                        //
+                        // Cancellation safety: read_message uses read_exact, which is NOT
+                        // cancel-safe. So we race only the single leading byte (read_u8 /
+                        // recv_async_code consume 0 bytes when pending), then drive the rest
+                        // of whichever frame won to completion off the hot path.
+                        if listening {
+                            // No idle-in-transaction timeout here: a LISTEN-pinned client
+                            // is not in a transaction, it is legitimately parked waiting
+                            // for notifications.
+                            loop {
+                                tokio::select! {
+                                    biased;
+
+                                    client_code = self.read.read_u8() => {
+                                        match client_code {
+                                            Ok(code) => {
+                                                break read_message_rest(&mut self.read, code).await?;
+                                            }
+                                            Err(err) => {
+                                                // Client disconnected. Clean up (UNLISTEN *) and reuse.
+                                                self.stats.disconnect();
+                                                server.checkin_cleanup().await?;
+                                                return Err(Error::SocketError(format!(
+                                                    "Error reading message code from client - Error {:?}",
+                                                    err
+                                                )));
+                                            }
+                                        }
+                                    }
+
+                                    server_code = server.recv_async_code() => {
+                                        let code = server_code?;
+                                        let frame = server.recv_async_frame(code).await?;
+                                        // Forward the notification verbatim to the client.
+                                        write_all_flush(&mut self.write, &frame).await?;
+                                    }
+                                }
+                            }
+                        } else {
+                            match tokio::time::timeout(
+                                idle_client_timeout_duration,
+                                read_message(&mut self.read),
+                            )
+                            .await
+                            {
+                                Ok(Ok(message)) => message,
+                                Ok(Err(err)) => {
+                                    // Client disconnected inside a transaction.
+                                    self.stats.disconnect();
+                                    if self.pending_copy_response {
+                                        server.mark_bad(
+                                            "client disconnected after CopyDone/CopyFail before Sync",
+                                        );
+                                        return Err(err);
+                                    }
+
+                                    // Clean up the server and re-use it.
+                                    server.checkin_cleanup().await?;
+
                                     return Err(err);
                                 }
+                                Err(_) => {
+                                    // Client idle in transaction timeout
+                                    error_response(&mut self.write, "idle transaction timeout").await?;
+                                    error!(
+                                        "Client idle in transaction timeout: \
+                                        {{ \
+                                            pool_name: {}, \
+                                            username: {}, \
+                                            shard: {:?}, \
+                                            role: \"{:?}\" \
+                                        }}",
+                                        self.pool_name,
+                                        self.username,
+                                        query_router.shard(),
+                                        query_router.role()
+                                    );
 
-                                // Clean up the server and re-use it.
-                                server.checkin_cleanup().await?;
-
-                                return Err(err);
-                            }
-                            Err(_) => {
-                                // Client idle in transaction timeout
-                                error_response(&mut self.write, "idle transaction timeout").await?;
-                                error!(
-                                    "Client idle in transaction timeout: \
-                                    {{ \
-                                        pool_name: {}, \
-                                        username: {}, \
-                                        shard: {:?}, \
-                                        role: \"{:?}\" \
-                                    }}",
-                                    self.pool_name,
-                                    self.username,
-                                    query_router.shard(),
-                                    query_router.role()
-                                );
-
-                                break;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1288,6 +1414,16 @@ where
                             }
                         }
 
+                        // Detect LISTEN: it pins the server to this client so async
+                        // notifications can be delivered. Latch it before the release
+                        // check below. Cheap text scan — works even when the query
+                        // parser is disabled (LISTEN is a simple-query in practice).
+                        if !listening && simple_query_is_listen(&message) {
+                            listening = true;
+                            server.mark_listening();
+                            debug!("Client issued LISTEN; pinning server connection for notifications");
+                        }
+
                         debug!("Sending query to server");
 
                         self.send_and_receive_loop(
@@ -1309,7 +1445,9 @@ where
 
                             // Release server back to the pool if we are in transaction mode.
                             // If we are in session mode, we keep the server until the client disconnects.
-                            if self.transaction_mode && !server.in_copy_mode() {
+                            // A LISTEN-pinned client keeps the server too, so notifications
+                            // from NOTIFY actually reach it.
+                            if self.transaction_mode && !server.in_copy_mode() && !listening {
                                 self.stats.idle();
 
                                 break;
@@ -1344,6 +1482,15 @@ where
                                     plugin_output = Some(output);
                                 }
                             }
+                        }
+
+                        // Extended-protocol LISTEN: the SQL text lives in the Parse
+                        // message. Latch here so the server stays pinned through the
+                        // Bind/Execute/Sync sequence and async notifications reach us.
+                        if !listening && parse_message_is_listen(&message) {
+                            listening = true;
+                            server.mark_listening();
+                            debug!("Client issued LISTEN (extended protocol); pinning server connection for notifications");
                         }
 
                         self.buffer_parse(message, &pool)?;
@@ -1734,7 +1881,8 @@ where
 
                             // Release server back to the pool if we are in transaction mode.
                             // If we are in session mode, we keep the server until the client disconnects.
-                            if self.transaction_mode && !server.in_copy_mode() {
+                            // A LISTEN-pinned client (extended protocol) keeps the server too.
+                            if self.transaction_mode && !server.in_copy_mode() && !listening {
                                 break;
                             }
                         }
@@ -2332,5 +2480,82 @@ impl<S, T> Drop for Client<S, T> {
         if self.connected_to_server && self.last_server_stats.is_some() {
             self.last_server_stats.as_ref().unwrap().idle();
         }
+    }
+}
+
+#[cfg(test)]
+mod listen_detection_tests {
+    use super::{parse_message_is_listen, simple_query_is_listen};
+    use bytes::{BufMut, BytesMut};
+
+    fn simple_query(sql: &str) -> BytesMut {
+        let mut msg = BytesMut::new();
+        msg.put_u8(b'Q');
+        // len = i32 self + sql bytes + null terminator
+        msg.put_i32((4 + sql.len() + 1) as i32);
+        msg.put_slice(sql.as_bytes());
+        msg.put_u8(0);
+        msg
+    }
+
+    // Parse: 'P' | len | statement_name cstring | query cstring | i16 nparams
+    fn parse_msg(stmt_name: &str, sql: &str) -> BytesMut {
+        let mut body = BytesMut::new();
+        body.put_slice(stmt_name.as_bytes());
+        body.put_u8(0);
+        body.put_slice(sql.as_bytes());
+        body.put_u8(0);
+        body.put_i16(0); // no param types
+
+        let mut msg = BytesMut::new();
+        msg.put_u8(b'P');
+        msg.put_i32((4 + body.len()) as i32);
+        msg.put_slice(&body);
+        msg
+    }
+
+    #[test]
+    fn detects_extended_listen() {
+        // anonymous statement (most common, e.g. sqlx)
+        assert!(parse_message_is_listen(&parse_msg("", "LISTEN pgrst_schema_reload")));
+        // named statement
+        assert!(parse_message_is_listen(&parse_msg("s1", "listen \"turso:schema\"")));
+        assert!(parse_message_is_listen(&parse_msg("", "  LISTEN chan ")));
+    }
+
+    #[test]
+    fn ignores_extended_non_listen() {
+        assert!(!parse_message_is_listen(&parse_msg("", "SELECT $1")));
+        assert!(!parse_message_is_listen(&parse_msg("", "UNLISTEN chan")));
+        assert!(!parse_message_is_listen(&parse_msg("named", "NOTIFY chan")));
+        // a 'Q' simple-query is not a Parse message
+        assert!(!parse_message_is_listen(&simple_query("LISTEN chan")));
+    }
+
+    #[test]
+    fn detects_listen() {
+        assert!(simple_query_is_listen(&simple_query("LISTEN pgrst_schema_reload")));
+        assert!(simple_query_is_listen(&simple_query("listen \"turso:schema\"")));
+        assert!(simple_query_is_listen(&simple_query("  LISTEN chan ")));
+        assert!(simple_query_is_listen(&simple_query("LISTEN chan;")));
+    }
+
+    #[test]
+    fn ignores_non_listen() {
+        assert!(!simple_query_is_listen(&simple_query("SELECT 1")));
+        assert!(!simple_query_is_listen(&simple_query("UNLISTEN chan")));
+        assert!(!simple_query_is_listen(&simple_query("NOTIFY chan")));
+        // not a fuzzy substring match
+        assert!(!simple_query_is_listen(&simple_query("SELECT 'LISTEN'")));
+    }
+
+    #[test]
+    fn ignores_non_query_messages() {
+        // 'P' (Parse), not a simple query
+        let mut parse = BytesMut::new();
+        parse.put_u8(b'P');
+        parse.put_i32(10);
+        parse.put_slice(b"LISTEN");
+        assert!(!simple_query_is_listen(&parse));
     }
 }

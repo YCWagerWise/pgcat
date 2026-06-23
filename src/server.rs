@@ -114,6 +114,10 @@ struct CleanupState {
 
     /// If server connection requires DEALLOCATE ALL before checkin because of prepare statement
     needs_cleanup_prepare: bool,
+
+    /// If server connection requires UNLISTEN * before checkin because the client
+    /// issued LISTEN (pinned the connection to receive async notifications).
+    needs_cleanup_listen: bool,
 }
 
 impl CleanupState {
@@ -121,11 +125,12 @@ impl CleanupState {
         CleanupState {
             needs_cleanup_set: false,
             needs_cleanup_prepare: false,
+            needs_cleanup_listen: false,
         }
     }
 
     fn needs_cleanup(&self) -> bool {
-        self.needs_cleanup_set || self.needs_cleanup_prepare
+        self.needs_cleanup_set || self.needs_cleanup_prepare || self.needs_cleanup_listen
     }
 
     fn set_true(&mut self) {
@@ -136,6 +141,7 @@ impl CleanupState {
     fn reset(&mut self) {
         self.needs_cleanup_set = false;
         self.needs_cleanup_prepare = false;
+        self.needs_cleanup_listen = false;
     }
 }
 
@@ -143,8 +149,8 @@ impl std::fmt::Display for CleanupState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SET: {}, PREPARE: {}",
-            self.needs_cleanup_set, self.needs_cleanup_prepare
+            "SET: {}, PREPARE: {}, LISTEN: {}",
+            self.needs_cleanup_set, self.needs_cleanup_prepare, self.needs_cleanup_listen
         )
     }
 }
@@ -1477,6 +1483,12 @@ impl Server {
                 }
             };
 
+            if self.cleanup_state.needs_cleanup_listen {
+                // Drop every channel subscription so notifications don't leak to the
+                // next client that checks out this connection.
+                reset_string.push_str("UNLISTEN *;");
+            };
+
             self.query(&reset_string).await?;
             self.cleanup_state.reset();
         }
@@ -1503,6 +1515,42 @@ impl Server {
     // Marks a connection as needing cleanup at checkin
     pub fn mark_dirty(&mut self) {
         self.cleanup_state.set_true();
+    }
+
+    /// Marks this server connection as carrying LISTEN subscriptions, so it gets
+    /// `UNLISTEN *` at checkin. Set when a client pins the connection to receive
+    /// async notifications.
+    pub fn mark_listening(&mut self) {
+        self.cleanup_state.needs_cleanup_listen = true;
+    }
+
+    /// Cancellation-safe: read just the message type byte off the server stream.
+    /// `read_u8` consumes zero bytes when it returns `Pending`, so this is safe to
+    /// race in a `tokio::select!`. Pair with `recv_async_frame` to finish the frame.
+    pub async fn recv_async_code(&mut self) -> Result<u8, Error> {
+        self.stream.read_u8().await.map_err(|err| {
+            self.bad = true;
+            Error::SocketError(format!(
+                "Error reading async message code from server {:?} - Error {:?}",
+                self.address, err
+            ))
+        })
+    }
+
+    /// Drive the rest of an async server message to completion (non-cancellable),
+    /// given the type byte already read by `recv_async_code`. Returns the full frame
+    /// (type byte + length + body) ready to forward verbatim to the client.
+    pub async fn recv_async_frame(&mut self, code: u8) -> Result<BytesMut, Error> {
+        match read_message_rest(&mut self.stream, code).await {
+            Ok(frame) => {
+                self.last_activity = SystemTime::now();
+                Ok(frame)
+            }
+            Err(err) => {
+                self.bad = true;
+                Err(err)
+            }
+        }
     }
 
     pub fn mirror_send(&mut self, bytes: &BytesMut) {
